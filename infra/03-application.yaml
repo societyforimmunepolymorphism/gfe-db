@@ -1,0 +1,163 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: SIP gfe-db application - Elastic Beanstalk + ALB
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.large
+    Description: EC2 instance type (Neo4j needs at least 4GB RAM)
+
+  ImgtRelease:
+    Type: String
+    Default: '3630'
+    Description: IMGT/HLA release version loaded in the image
+
+Resources:
+
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: ALB - allow HTTPS from within VPC only
+      VpcId: !ImportValue sip-gfe-db-vpc-id
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 7473
+          ToPort: 7473
+          CidrIp: 10.0.0.0/16
+        - IpProtocol: tcp
+          FromPort: 7687
+          ToPort: 7687
+          CidrIp: 10.0.0.0/16
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: EB instances - allow traffic from ALB only
+      VpcId: !ImportValue sip-gfe-db-vpc-id
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 7474
+          ToPort: 7474
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 7473
+          ToPort: 7473
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 7687
+          ToPort: 7687
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+
+  EBInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sip-gfe-db-eb-instance-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkWebTier
+        - arn:aws:iam::aws:policy/AmazonEC2ContainerRegistryReadOnly
+
+  EBInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EBInstanceRole
+
+  EBServiceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: sip-gfe-db-eb-service-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: elasticbeanstalk.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSElasticBeanstalkEnhancedHealth
+        - arn:aws:iam::aws:policy/AWSElasticBeanstalkManagedUpdatesCustomerRolePolicy
+
+  EBApplication:
+    Type: AWS::ElasticBeanstalk::Application
+    Properties:
+      ApplicationName: sip-gfe-db
+
+  EBEnvironment:
+    Type: AWS::ElasticBeanstalk::Environment
+    Properties:
+      ApplicationName: !Ref EBApplication
+      EnvironmentName: sip-gfe-db-prod
+      SolutionStackName: 64bit Amazon Linux 2 v3.8.0 running Docker
+      OptionSettings:
+        # VPC
+        - Namespace: aws:ec2:vpc
+          OptionName: VPCId
+          Value: !ImportValue sip-gfe-db-vpc-id
+        - Namespace: aws:ec2:vpc
+          OptionName: Subnets
+          Value: !Join
+            - ','
+            - - !ImportValue sip-gfe-db-private-subnet-a
+              - !ImportValue sip-gfe-db-private-subnet-b
+        - Namespace: aws:ec2:vpc
+          OptionName: ELBSubnets
+          Value: !Join
+            - ','
+            - - !ImportValue sip-gfe-db-public-subnet-a
+              - !ImportValue sip-gfe-db-public-subnet-b
+        - Namespace: aws:ec2:vpc
+          OptionName: AssociatePublicIpAddress
+          Value: false
+        # Instance
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: InstanceType
+          Value: !Ref InstanceType
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: IamInstanceProfile
+          Value: !Ref EBInstanceProfile
+        - Namespace: aws:autoscaling:launchconfiguration
+          OptionName: SecurityGroups
+          Value: !Ref InstanceSecurityGroup
+        # ALB
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: LoadBalancerType
+          Value: application
+        - Namespace: aws:elasticbeanstalk:environment
+          OptionName: ServiceRole
+          Value: !Ref EBServiceRole
+        - Namespace: aws:elbv2:loadbalancer
+          OptionName: SecurityGroups
+          Value: !Ref ALBSecurityGroup
+        # Single instance (no autoscaling needed for a DB)
+        - Namespace: aws:autoscaling:asg
+          OptionName: MinSize
+          Value: '1'
+        - Namespace: aws:autoscaling:asg
+          OptionName: MaxSize
+          Value: '1'
+        # Health check
+        - Namespace: aws:elasticbeanstalk:healthreporting:system
+          OptionName: SystemType
+          Value: enhanced
+        # Environment variables
+        - Namespace: aws:elasticbeanstalk:application:environment
+          OptionName: IMGT_RELEASE
+          Value: !Ref ImgtRelease
+
+Outputs:
+  EBEnvironmentName:
+    Value: !Ref EBEnvironment
+
+  EBApplicationName:
+    Value: !Ref EBApplication

@@ -1,0 +1,90 @@
+name: Build and Deploy gfe-db
+
+on:
+  push:
+    branches:
+      - sip-infra
+    paths:
+      - 'Dockerfile'
+      - 'bin/**'
+      - 'infra/**'
+      - '.github/workflows/deploy.yml'
+
+env:
+  AWS_REGION: us-west-1
+  AWS_ACCOUNT_ID: 512644056873
+  ECR_REPOSITORY: gfe-db
+  EB_APPLICATION: sip-gfe-db
+  EB_ENVIRONMENT: sip-gfe-db-prod
+  IMGT_RELEASE: '3630'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/gfe-db-github-actions
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ env.IMGT_RELEASE }}
+        run: |
+          docker build \
+            --build-arg IMGT=${{ env.IMGT_RELEASE }} \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG \
+            --tag $ECR_REGISTRY/$ECR_REPOSITORY:latest \
+            .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+
+      - name: Generate Dockerrun.aws.json
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          cat > Dockerrun.aws.json <<EOF
+          {
+            "AWSEBDockerrunVersion": "1",
+            "Image": {
+              "Name": "$ECR_REGISTRY/$ECR_REPOSITORY:${{ env.IMGT_RELEASE }}",
+              "Update": "true"
+            },
+            "Ports": [
+              { "ContainerPort": "7474" },
+              { "ContainerPort": "7473" },
+              { "ContainerPort": "7687" }
+            ]
+          }
+          EOF
+
+      - name: Deploy to Elastic Beanstalk
+        run: |
+          ARTIFACT=gfe-db-${{ env.IMGT_RELEASE }}-${{ github.sha }}.zip
+          zip $ARTIFACT Dockerrun.aws.json
+
+          aws s3 cp $ARTIFACT \
+            s3://sip-gfe-db-artifacts-${{ env.AWS_ACCOUNT_ID }}/$ARTIFACT
+
+          aws elasticbeanstalk create-application-version \
+            --application-name ${{ env.EB_APPLICATION }} \
+            --version-label ${{ env.IMGT_RELEASE }}-${{ github.sha }} \
+            --source-bundle S3Bucket=sip-gfe-db-artifacts-${{ env.AWS_ACCOUNT_ID }},S3Key=$ARTIFACT
+
+          aws elasticbeanstalk update-environment \
+            --environment-name ${{ env.EB_ENVIRONMENT }} \
+            --version-label ${{ env.IMGT_RELEASE }}-${{ github.sha }}
